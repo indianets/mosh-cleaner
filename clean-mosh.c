@@ -2,32 +2,35 @@
 #include <signal.h>
 #include <time.h>
 #include <utmp.h>
+#include <pwd.h>
+#include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 struct mosh {
 	time_t last_used;
 	int has_ip;
-	int pid;
+	pid_t pid;
 	struct mosh *next;
 };
 
 struct user {
-	char username[UT_NAMESIZE];
+	uid_t uid;
 	struct mosh *head;
 	struct user *next;
 };
 
-static inline struct user *new_user(char *username)
+static inline struct user *new_user(uid_t uid)
 {
 	struct user *user;
 	user = malloc(sizeof(struct user));
 	if (!user) {
-		perror("user");
+		perror("[-] user");
 		exit(EXIT_FAILURE);
 	}
-	strcpy(user->username, username);
+	user->uid = uid;
 	user->head = NULL;
 	user->next = NULL;
 	return user;
@@ -42,12 +45,14 @@ int main(int argc, char *argv[])
 	struct utmp entry;
 	struct user *user_head = NULL, *user;
 	struct mosh *parsed, *insert, **prev;
-	char *bracket_open, *bracket_close;
-	int kill_time;
+	char *bracket_open, *bracket_close, proc_pid[128];
+	time_t kill_time;
+	struct passwd *passwd;
+	struct stat sbuf;
 
 	utmp = fopen("/var/run/utmp", "r");
 	if (!utmp) {
-		perror("fopen");
+		perror("[-] fopen(\"/var/run/utmp\", read-only)");
 		return EXIT_FAILURE;
 	}
 	while (fread(&entry, sizeof(entry), 1, utmp)) {
@@ -57,10 +62,13 @@ int main(int argc, char *argv[])
 		bracket_close = strrchr(entry.ut_host, ']');
 		if (!bracket_open || !bracket_close || bracket_open >= bracket_close)
 			continue;
+		passwd = getpwnam(entry.ut_user);
+		if (!passwd)
+			continue;
 
 		parsed = malloc(sizeof(struct mosh));
 		if (!parsed) {
-			perror("malloc");
+			perror("[-] malloc");
 			return EXIT_FAILURE;
 		}
 		parsed->next = NULL;
@@ -71,13 +79,13 @@ int main(int argc, char *argv[])
 
 
 		if (!user_head)
-			user_head = user = new_user(entry.ut_user);
+			user_head = user = new_user(passwd->pw_uid);
 		else {
 			for (user = user_head; user; user = user->next) {
-				if (!strcmp(entry.ut_user, user->username))
+				if (user->uid == passwd->pw_uid)
 					break;
 				if (!user->next) {
-					user->next = new_user(entry.ut_user);
+					user->next = new_user(passwd->pw_uid);
 					user = user->next;
 					break;
 				}
@@ -106,9 +114,31 @@ int main(int argc, char *argv[])
 				continue;
 			if (time(NULL) - parsed->last_used < kill_time) /* If the connection is less than an hour old, we don't kill it. */
 				continue;
-			printf("[+] Killing %s's mosh instance %d, last used on %s", user->username, parsed->pid, ctime(&parsed->last_used));
+			snprintf(proc_pid, sizeof(proc_pid), "/proc/%d", parsed->pid);
+			if (stat(proc_pid, &sbuf)) {
+				perror("[-] stat");
+				continue;
+			}
+			if (sbuf.st_uid == 0 || user->uid != sbuf.st_uid)
+				continue;
+
+			if (setresgid(sbuf.st_gid, sbuf.st_gid, -1)) {
+				perror("[-] setresgid(st_gid)");
+				continue;
+			}
+			if (setresuid(sbuf.st_uid, sbuf.st_uid, -1)) {
+				perror("[-] setresuid(st_uid)");
+				if (setresgid(0, 0, -1))
+					perror("[-] setresgid(0)");
+				continue;
+			}
+			fprintf(stderr, "[+] Killing %d's mosh instance %d, last used on %s", user->uid, parsed->pid, ctime(&parsed->last_used));
 			if (kill(parsed->pid, SIGTERM))
-				perror("kill");
+				perror("[-] kill");
+			if (setresuid(0, 0, -1))
+				perror("[-] setresuid(0, 0, -1)");
+			if (setresgid(0, 0, -1))
+				perror("[-] setresgid(0, 0, -1)");
 		}
 	}
 
